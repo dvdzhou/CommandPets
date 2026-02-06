@@ -1,0 +1,10 @@
+name: CommandPets
+version: 1.0
+main: com.daluxea.commandpets.CommandPets
+api-version: 1.21
+authors: [Daluxea]
+commands:
+  pets:
+    description: Comandi tattici per i tuoi animali
+    usage: /pets help
+    aliases: [cpets, mypets]
