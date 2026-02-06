@@ -13,6 +13,7 @@ It allows you to manage dogs and cats with squad commands, teleport them, set a 
 * **⚔️ Threat Detection:** Dogs recognize if a player approaches you holding a weapon (Sword, Axe, Trident, Mace) and react accordingly.
 * **🤝 Friend System (Whitelist):** Add your friends to a safe list so your dogs never attack them.
 * **📡 Tactical Commands:** Call to you (`call`), make them sit (`sit`), or send home (`gohome`) all your pets with a single command.
+* **🔇 Smart Silence:** Option to automatically silence your pets when they are sitting at home, so they don't disturb you with constant barking/meowing.
 * **🐈 Multi-Species Support:** Specific commands for dogs only, cats only, or both.
 * **💾 Persistence:** Friends list, home locations, and settings are saved automatically.
 
@@ -21,20 +22,26 @@ It allows you to manage dogs and cats with squad commands, teleport them, set a 
 The main command is `/pets` (aliases: `/cpets`, `/mypets`).
 
 ### Movement & Management
-* `/pets call [dogs|cats]`  
+* `/pets call [dogs|cats] [adults|babies|all]`  
     *Teleports pets to your location and makes them stand up (ready for action).*
-* `/pets gohome [dogs|cats]`  
+* `/pets gohome [dogs|cats] [adults|babies|all]`  
     *Sends pets to the saved home location and makes them sit.*
-* `/pets sit [dogs|cats]`  
+* `/pets sit [dogs|cats] [adults|babies|all]`  
     *Makes all nearby pets sit immediately.*
-* `/pets stand [dogs|cats]`  
+* `/pets stand [dogs|cats] [adults|babies|all]`  
     *Makes all nearby pets stand up.*
 * `/pets sethome`  
     *Sets your current location as the "Home" point for your pets.*
+* `/pets count`
+    *Shows a census of your currently loaded pets (Dogs, Cats, and total count).*
 
-### Combat & Friends
+### Settings & Combat
 * `/pets attack <on|off>`  
     *Toggles the automatic attack mode for your dogs. Useful if you want to be peaceful.*
+* `/pets silence <on|off>`  
+    *Toggles "Silent Mode". If ON, sitting pets become silent. If OFF, they resume making vanilla sounds.*
+
+### Friends System
 * `/pets friends add <player>`  
     *Adds a player to your whitelist (your pets will ignore them).*
 * `/pets friends remove <player>`  
@@ -65,6 +72,7 @@ If you want to modify the source code:
 
 * **API Version:** Built against Spigot/Paper 1.21.11 API.
 * **Protection Radius:** The auto-protection radius is set to **10 blocks**.
+* **Anti-Cramming:** The teleport logic strictly limits density to **3 pets per block** to prevent entity cramming damage.
 * **Data:** The plugin saves data in `plugins/CommandPets/data.yml`.
 
 ## 📄 License

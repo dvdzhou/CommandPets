@@ -5,6 +5,8 @@ import org.bukkit.ChatColor;
 import org.bukkit.Location;
 import org.bukkit.Material;
 import org.bukkit.World;
+import org.bukkit.block.Block;
+import org.bukkit.block.BlockFace;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
@@ -24,11 +26,15 @@ import java.util.stream.Collectors;
 public class CommandPets extends JavaPlugin implements CommandExecutor, TabCompleter {
 
     private final double PROTECTION_RADIUS = 10.0;
+    private final double MAX_DISTANCE_FROM_OWNER = 20.0;
+    private final int MAX_PETS_PER_BLOCK = 3; 
+    private final int MAX_SEARCH_RANGE = 10; 
     
-    // Dati salvati
+    // Saved Data
     private Map<UUID, Set<UUID>> friendList = new HashMap<>();
     private Map<UUID, Location> homeLocations = new HashMap<>();
     private Map<UUID, Boolean> attackMode = new HashMap<>(); 
+    private Map<UUID, Boolean> silenceMode = new HashMap<>(); 
     
     private File dataFile;
     private FileConfiguration dataConfig;
@@ -42,37 +48,48 @@ public class CommandPets extends JavaPlugin implements CommandExecutor, TabCompl
             getCommand("pets").setTabCompleter(this);
         }
         
-        getLogger().info("CommandPets v1.0 abilitato!");
+        getLogger().info("CommandPets v1.0 enabled!");
         startGuardTask();
     }
 
     @Override
     public void onDisable() {
         saveData();
-        getLogger().info("CommandPets disabilitato!");
+        getLogger().info("CommandPets disabled.");
     }
 
-    // --- LOGICA PROTEZIONE (Guard Mode) ---
+    // --- GUARD LOGIC ---
     private void startGuardTask() {
         new BukkitRunnable() {
             @Override
             public void run() {
                 for (Player player : Bukkit.getOnlinePlayers()) {
-                    // Controlla se il player ha la modalità attacco attiva (default: true)
-                    if (attackMode.getOrDefault(player.getUniqueId(), true)) {
-                        checkPlayerWolves(player);
-                    }
+                    boolean guardActive = attackMode.getOrDefault(player.getUniqueId(), false);
+                    checkPlayerWolves(player, guardActive);
                 }
             }
         }.runTaskTimer(this, 0L, 20L);
     }
 
-    private void checkPlayerWolves(Player owner) {
+    private void checkPlayerWolves(Player owner, boolean guardActive) {
         for (Entity entity : owner.getWorld().getEntities()) {
             if (entity instanceof Wolf) {
                 Wolf wolf = (Wolf) entity;
-                // Attacca solo se: addomesticato, del player, NON seduto
-                if (wolf.isTamed() && wolf.getOwner() != null && wolf.getOwner().equals(owner) && !wolf.isSitting()) {
+                
+                if (!wolf.isTamed() || wolf.getOwner() == null || !wolf.getOwner().equals(owner)) continue;
+                if (wolf.isSitting()) continue;
+                if (wolf.isLoveMode()) continue;
+                if (!wolf.isAdult()) continue; // Babies don't fight
+
+                // Safety Recall
+                if (wolf.getLocation().distanceSquared(owner.getLocation()) > (MAX_DISTANCE_FROM_OWNER * MAX_DISTANCE_FROM_OWNER)) {
+                    wolf.teleport(owner.getLocation());
+                    wolf.setTarget(null);
+                    wolf.setAngry(false);
+                    continue; 
+                }
+
+                if (guardActive) {
                     scanForThreats(wolf, owner);
                 }
             }
@@ -83,16 +100,15 @@ public class CommandPets extends JavaPlugin implements CommandExecutor, TabCompl
         if (wolf.getTarget() != null && !wolf.getTarget().isDead()) return;
 
         List<Entity> nearbyEntities = owner.getNearbyEntities(PROTECTION_RADIUS, PROTECTION_RADIUS, PROTECTION_RADIUS);
+        Collections.shuffle(nearbyEntities);
 
         for (Entity target : nearbyEntities) {
-            // 1. Mostri
             if (target instanceof Monster) {
                 if (target != wolf && target != owner) {
                     wolf.setTarget((LivingEntity) target);
-                    return;
+                    return; 
                 }
             }
-            // 2. Player Ostili (Armati)
             if (target instanceof Player) {
                 Player targetPlayer = (Player) target;
                 if (targetPlayer.equals(owner)) continue;
@@ -110,78 +126,196 @@ public class CommandPets extends JavaPlugin implements CommandExecutor, TabCompl
         ItemStack item = player.getInventory().getItemInMainHand();
         if (item == null || item.getType() == Material.AIR) return false;
         String typeName = item.getType().toString();
-        // Supporto per tutte le armi principali
         return typeName.endsWith("_SWORD") || typeName.endsWith("_AXE") || 
                typeName.equals("TRIDENT") || typeName.equals("MACE");
     }
 
-    // --- GESTIONE MOVIMENTI E STATO (Call, Sit, Home) ---
+    // --- SMART MOVEMENT MANAGEMENT ---
 
-    private void managePets(Player player, Location dest, String action, String typeFilter) {
-        int count = 0;
-        String typeMsg = "animali";
+    private void managePets(Player player, Location baseDest, String action, String typeFilter, String ageFilter) {
+        List<Tameable> petsToMove = new ArrayList<>();
+        String typeMsg = "pets";
+        
         boolean sitDown = action.equals("sit") || action.equals("gohome");
         boolean teleport = action.equals("call") || action.equals("gohome");
+        boolean wantSilence = silenceMode.getOrDefault(player.getUniqueId(), true);
 
+        // 1. Filter Pets
         for (World world : Bukkit.getWorlds()) {
             for (Entity entity : world.getEntities()) {
                 if (entity instanceof Tameable) {
                     Tameable pet = (Tameable) entity;
-                    
-                    // Verifica proprietà
                     if (!pet.isTamed() || pet.getOwner() == null || !pet.getOwner().equals(player)) continue;
 
+                    // Age Filter
+                    if (pet instanceof Ageable) {
+                        Ageable ageable = (Ageable) pet;
+                        if (ageFilter.equals("adults") && !ageable.isAdult()) continue;
+                        if (ageFilter.equals("babies") && ageable.isAdult()) continue;
+                    }
+
+                    // Type Filter
                     boolean isWolf = pet instanceof Wolf;
                     boolean isCat = pet instanceof Cat;
-                    boolean shouldAct = false;
+                    boolean match = false;
 
-                    // Filtri Specie
                     if (typeFilter.equals("all")) {
-                        if (isWolf || isCat) shouldAct = true;
+                        if (isWolf || isCat) match = true;
                     } else if (typeFilter.equals("dogs") && isWolf) {
-                        shouldAct = true;
-                        typeMsg = "cani";
+                        match = true; typeMsg = "dogs";
                     } else if (typeFilter.equals("cats") && isCat) {
-                        shouldAct = true;
-                        typeMsg = "gatti";
+                        match = true; typeMsg = "cats";
                     }
 
-                    if (shouldAct) {
-                        // Teletrasporto
-                        if (teleport && dest != null) pet.teleport(dest);
-                        
-                        // Cambio stato (Seduto/In Piedi)
-                        if (entity instanceof Sittable) {
-                            Sittable sittablePet = (Sittable) entity;
-                            if (action.equals("sit") || action.equals("gohome")) {
-                                sittablePet.setSitting(true);
-                            } else if (action.equals("call") || action.equals("stand")) {
-                                sittablePet.setSitting(false);
-                            }
-                        }
-
-                        // Reset Target per i Lupi se richiamati (per farli smettere di combattere)
-                        if ((action.equals("call") || action.equals("stand")) && isWolf) {
-                            ((Wolf) pet).setTarget(null); 
-                        }
-                        
-                        count++;
-                    }
+                    if (match) petsToMove.add(pet);
                 }
             }
         }
 
-        // Feedback al giocatore
-        if (count > 0) {
-            String verb = teleport ? "Teletrasportati" : (sitDown ? "Seduti" : "Alzati");
-            player.sendMessage(ChatColor.GREEN + verb + " " + count + " " + typeMsg + ".");
-        } else {
-            player.sendMessage(ChatColor.YELLOW + "Nessun " + typeMsg + " trovato nei paraggi.");
+        int totalPets = petsToMove.size();
+        if (totalPets == 0) {
+            String ageMsg = ageFilter.equals("all") ? "" : (" (" + ageFilter + ")");
+            player.sendMessage(ChatColor.YELLOW + "No " + typeMsg + ageMsg + " found nearby.");
+            return;
+        }
+
+        // 2. Safe Spots Calculation (Flood Fill)
+        Queue<Location> safeSpots = new LinkedList<>();
+        if (teleport && baseDest != null) {
+            int spotsNeeded = (int) Math.ceil((double) totalPets / MAX_PETS_PER_BLOCK);
+            List<Location> foundSpots = findWalkableSpots(baseDest, spotsNeeded);
+            safeSpots.addAll(foundSpots);
+            
+            if (foundSpots.isEmpty()) {
+                player.sendMessage(ChatColor.RED + "WARNING: No safe space found! Pets will not teleport.");
+                return;
+            }
+        }
+
+        // 3. Execution
+        int movedCount = 0;
+        
+        for (Tameable pet : petsToMove) {
+            if (teleport && baseDest != null) {
+                Location targetLoc = safeSpots.peek();
+                if (targetLoc != null) {
+                    Location finalLoc = targetLoc.clone().add(0.5, 0, 0.5);
+                    finalLoc.setYaw((float) (Math.random() * 360));
+                    pet.teleport(finalLoc);
+                    movedCount++;
+                    safeSpots.add(safeSpots.poll()); // Rotate spots
+                } else {
+                    continue; 
+                }
+            } else {
+                movedCount++;
+            }
+            
+            if (pet instanceof Sittable) {
+                Sittable sittablePet = (Sittable) pet;
+                if (sitDown) {
+                    sittablePet.setSitting(true);
+                    if (wantSilence) pet.setSilent(true);
+                    if (pet instanceof Wolf) {
+                        ((Wolf) pet).setTarget(null);
+                        ((Wolf) pet).setAngry(false); 
+                    }
+                } else {
+                    sittablePet.setSitting(false);
+                    pet.setSilent(false);
+                }
+            }
+            
+            if ((!sitDown) && pet instanceof Wolf) {
+                ((Wolf) pet).setTarget(null); 
+                ((Wolf) pet).setAngry(false);
+            }
+        }
+
+        String verb = teleport ? "Teleported" : (sitDown ? "Sat down" : "Stood up");
+        String ageSuffix = ageFilter.equals("all") ? "" : (" (" + ageFilter + ")");
+        player.sendMessage(ChatColor.GREEN + verb + " " + movedCount + " " + typeMsg + ageSuffix + ".");
+        
+        if (teleport && movedCount < totalPets) {
+            player.sendMessage(ChatColor.RED + "(Some pets stayed behind because there was no safe space).");
         }
     }
 
-    // --- GESTIONE DATI (IO) ---
+    // --- ALGORITHM: FLOOD FILL (BFS) ---
+    private List<Location> findWalkableSpots(Location start, int maxSpotsNeeded) {
+        List<Location> validSpots = new ArrayList<>();
+        Set<String> visited = new HashSet<>();
+        Queue<Location> queue = new LinkedList<>();
+        
+        Location startBlock = start.getBlock().getLocation();
+        queue.add(startBlock);
+        visited.add(locKey(startBlock));
 
+        int[][] dirs = {{1,0}, {-1,0}, {0,1}, {0,-1}};
+
+        while (!queue.isEmpty() && validSpots.size() < maxSpotsNeeded * 2) {
+            Location current = queue.poll();
+            
+            if (isSafeSpot(current)) {
+                for(int i=0; i<MAX_PETS_PER_BLOCK; i++) validSpots.add(current);
+                if (validSpots.size() >= maxSpotsNeeded) break;
+            }
+
+            if (current.distanceSquared(startBlock) > MAX_SEARCH_RANGE * MAX_SEARCH_RANGE) continue;
+
+            for (int[] d : dirs) {
+                Location neighbor = current.clone().add(d[0], 0, d[1]);
+                Location targetNeighbor = null;
+                
+                if (canStepTo(current, neighbor)) targetNeighbor = neighbor;
+                else if (canStepTo(current, neighbor.clone().add(0, 1, 0))) targetNeighbor = neighbor.clone().add(0, 1, 0);
+                else if (canStepTo(current, neighbor.clone().add(0, -1, 0))) targetNeighbor = neighbor.clone().add(0, -1, 0);
+
+                if (targetNeighbor != null) {
+                    String key = locKey(targetNeighbor);
+                    if (!visited.contains(key)) {
+                        visited.add(key);
+                        queue.add(targetNeighbor);
+                    }
+                }
+            }
+        }
+        return validSpots;
+    }
+
+    private String locKey(Location l) { return l.getBlockX() + "," + l.getBlockY() + "," + l.getBlockZ(); }
+
+    private boolean isSafeSpot(Location loc) {
+        Block feet = loc.getBlock();
+        Block head = feet.getRelative(BlockFace.UP);
+        Block ground = feet.getRelative(BlockFace.DOWN);
+        return feet.isPassable() && head.isPassable() && ground.getType().isSolid();
+    }
+
+    private boolean canStepTo(Location from, Location to) {
+        return isSafeSpot(to);
+    }
+
+    private void updateSilenceState(Player player) {
+        boolean wantSilence = silenceMode.getOrDefault(player.getUniqueId(), true);
+        for (World world : Bukkit.getWorlds()) {
+            for (Entity entity : world.getEntities()) {
+                if (entity instanceof Tameable && entity instanceof Sittable) {
+                    Tameable pet = (Tameable) entity;
+                    Sittable sittable = (Sittable) entity;
+                    if (pet.isTamed() && pet.getOwner() != null && pet.getOwner().equals(player)) {
+                        if (sittable.isSitting()) {
+                            pet.setSilent(wantSilence);
+                        } else {
+                            pet.setSilent(false);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // --- DATA IO ---
     private boolean isFriend(UUID ownerId, UUID friendId) {
         return friendList.containsKey(ownerId) && friendList.get(ownerId).contains(friendId);
     }
@@ -189,16 +323,12 @@ public class CommandPets extends JavaPlugin implements CommandExecutor, TabCompl
     private void loadData() {
         dataFile = new File(getDataFolder(), "data.yml");
         if (!dataFile.exists()) {
-            dataFile.getParentFile().mkdirs();
-            saveResource("data.yml", false);
+            try { dataFile.getParentFile().mkdirs(); dataFile.createNewFile(); } 
+            catch (IOException e) { e.printStackTrace(); }
         }
         dataConfig = YamlConfiguration.loadConfiguration(dataFile);
-        
-        friendList.clear();
-        homeLocations.clear();
-        attackMode.clear();
+        friendList.clear(); homeLocations.clear(); attackMode.clear(); silenceMode.clear();
 
-        // Caricamento Liste
         if (dataConfig.contains("friends")) {
             for (String key : dataConfig.getConfigurationSection("friends").getKeys(false)) {
                 try {
@@ -211,23 +341,23 @@ public class CommandPets extends JavaPlugin implements CommandExecutor, TabCompl
         }
         if (dataConfig.contains("homes")) {
             for (String key : dataConfig.getConfigurationSection("homes").getKeys(false)) {
-                try {
-                    homeLocations.put(UUID.fromString(key), dataConfig.getLocation("homes." + key));
-                } catch (Exception e) {}
+                try { homeLocations.put(UUID.fromString(key), dataConfig.getLocation("homes." + key)); } catch (Exception e) {}
             }
         }
-        if (dataConfig.contains("attack_mode")) {
-            for (String key : dataConfig.getConfigurationSection("attack_mode").getKeys(false)) {
-                try {
-                    attackMode.put(UUID.fromString(key), dataConfig.getBoolean("attack_mode." + key));
-                } catch (Exception e) {}
+        if (dataConfig.contains("settings.attack")) {
+            for (String key : dataConfig.getConfigurationSection("settings.attack").getKeys(false)) {
+                attackMode.put(UUID.fromString(key), dataConfig.getBoolean("settings.attack." + key));
+            }
+        }
+        if (dataConfig.contains("settings.silence")) {
+            for (String key : dataConfig.getConfigurationSection("settings.silence").getKeys(false)) {
+                silenceMode.put(UUID.fromString(key), dataConfig.getBoolean("settings.silence." + key));
             }
         }
     }
 
     private void saveData() {
         if (dataFile == null || dataConfig == null) return;
-        
         for (Map.Entry<UUID, Set<UUID>> entry : friendList.entrySet()) {
             List<String> sList = entry.getValue().stream().map(UUID::toString).collect(Collectors.toList());
             dataConfig.set("friends." + entry.getKey().toString(), sList);
@@ -236,112 +366,150 @@ public class CommandPets extends JavaPlugin implements CommandExecutor, TabCompl
             dataConfig.set("homes." + entry.getKey().toString(), entry.getValue());
         }
         for (Map.Entry<UUID, Boolean> entry : attackMode.entrySet()) {
-            dataConfig.set("attack_mode." + entry.getKey().toString(), entry.getValue());
+            dataConfig.set("settings.attack." + entry.getKey().toString(), entry.getValue());
+        }
+        for (Map.Entry<UUID, Boolean> entry : silenceMode.entrySet()) {
+            dataConfig.set("settings.silence." + entry.getKey().toString(), entry.getValue());
         }
         try { dataConfig.save(dataFile); } catch (IOException e) { e.printStackTrace(); }
     }
 
-    // --- COMANDI E TAB COMPLETE ---
+    // --- COMMANDS ---
 
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
-        if (!(sender instanceof Player)) {
-            sender.sendMessage("Solo i player possono usare CommandPets.");
-            return true;
-        }
+        if (!(sender instanceof Player)) { sender.sendMessage("CommandPets can only be used by players."); return true; }
         Player player = (Player) sender;
         UUID ownerId = player.getUniqueId();
 
-        if (args.length == 0 || args[0].equalsIgnoreCase("help")) {
-            sendHelp(player);
-            return true;
-        }
-
+        if (args.length == 0 || args[0].equalsIgnoreCase("help")) { sendHelp(player); return true; }
         String mainArg = args[0].toLowerCase();
 
-        // 1. SETHOME
         if (mainArg.equals("sethome")) {
             homeLocations.put(ownerId, player.getLocation());
-            player.sendMessage(ChatColor.GREEN + "Cuccia impostata in questa posizione!");
+            player.sendMessage(ChatColor.GREEN + "Home sweet home! Bedding location set right here.");
             saveData();
             return true;
         }
 
-        // 2. ATTACK ON/OFF
-        if (mainArg.equals("attack")) {
-            if (args.length < 2) {
-                player.sendMessage(ChatColor.RED + "Usa: /pets attack <on|off>");
-                return true;
+        if (mainArg.equals("attack") || mainArg.equals("guard")) {
+            if (args.length < 2) { 
+                boolean current = attackMode.getOrDefault(ownerId, true);
+                player.sendMessage(ChatColor.YELLOW + "Guard Mode is currently: " + (current ? ChatColor.GREEN + "ON" : ChatColor.RED + "OFF"));
+                return true; 
             }
             boolean mode = args[1].equalsIgnoreCase("on");
             attackMode.put(ownerId, mode);
-            player.sendMessage(ChatColor.YELLOW + "Modalità guardia: " + (mode ? ChatColor.GREEN + "ATTIVA" : ChatColor.RED + "DISATTIVA"));
+            player.sendMessage(ChatColor.YELLOW + "Guard Mode set to: " + (mode ? ChatColor.GREEN + "ON" : ChatColor.RED + "OFF"));
             saveData();
             return true;
         }
 
-        // 3. FRIENDS
-        if (mainArg.equals("friends")) {
-            if (args.length < 2) {
-                player.sendMessage(ChatColor.RED + "Usa: /pets friends <add|remove|list> [nome]");
-                return true;
+        if (mainArg.equals("silence") || mainArg.equals("quiet")) {
+            if (args.length < 2) { 
+                boolean current = silenceMode.getOrDefault(ownerId, true);
+                player.sendMessage(ChatColor.YELLOW + "Silent Mode is currently: " + (current ? ChatColor.GREEN + "ON" : ChatColor.RED + "OFF"));
+                return true; 
             }
+            boolean mode = args[1].equalsIgnoreCase("on");
+            silenceMode.put(ownerId, mode);
+            player.sendMessage(ChatColor.YELLOW + "Silent Mode set to: " + (mode ? ChatColor.GREEN + "ON" : ChatColor.RED + "OFF"));
+            updateSilenceState(player);
+            saveData();
+            return true;
+        }
+
+        if (mainArg.equals("friends")) {
+            if (args.length < 2) { player.sendMessage(ChatColor.RED + "Usage: /pets friends < add | remove | list > [name]"); return true; }
             String sub = args[1].toLowerCase();
             
             if (sub.equals("list")) {
                 if (!friendList.containsKey(ownerId) || friendList.get(ownerId).isEmpty()) {
-                    player.sendMessage(ChatColor.GRAY + "La tua lista amici è vuota.");
+                    player.sendMessage(ChatColor.GRAY + "Your friend list is empty.");
                 } else {
-                    player.sendMessage(ChatColor.GOLD + "Amici fidati: " + ChatColor.GREEN + 
+                    player.sendMessage(ChatColor.GOLD + "Trusted Friends: " + ChatColor.GREEN + 
                         friendList.get(ownerId).stream().map(id -> Bukkit.getOfflinePlayer(id).getName()).collect(Collectors.joining(", ")));
                 }
                 return true;
             }
-
-            if (args.length < 3) {
-                player.sendMessage(ChatColor.RED + "Specifica il nome del giocatore.");
-                return true;
-            }
-            
+            if (args.length < 3) { player.sendMessage(ChatColor.RED + "Please specify the player name."); return true; }
             String targetName = args[2];
             org.bukkit.OfflinePlayer target = Bukkit.getPlayer(targetName);
             if (target == null) target = Bukkit.getOfflinePlayer(targetName);
-            if (target.getUniqueId() == null) { player.sendMessage(ChatColor.RED + "Giocatore mai visto."); return true; }
+            if (target.getUniqueId() == null) { player.sendMessage(ChatColor.RED + "Player never seen before."); return true; }
             
             if (sub.equals("add")) {
-                if (target.getUniqueId().equals(ownerId)) { player.sendMessage(ChatColor.RED + "Non puoi aggiungere te stesso."); return true; }
+                if (target.getUniqueId().equals(ownerId)) { player.sendMessage(ChatColor.RED + "You cannot add yourself to the friend list."); return true; }
                 friendList.computeIfAbsent(ownerId, k -> new HashSet<>()).add(target.getUniqueId());
-                player.sendMessage(ChatColor.GREEN + targetName + " aggiunto agli amici.");
+                player.sendMessage(ChatColor.GREEN + targetName + " has been added to your trusted friends.");
                 saveData();
             } else if (sub.equals("remove")) {
                 if (friendList.containsKey(ownerId) && friendList.get(ownerId).remove(target.getUniqueId())) {
-                    player.sendMessage(ChatColor.YELLOW + targetName + " rimosso dagli amici.");
+                    player.sendMessage(ChatColor.YELLOW + targetName + " has been removed from friends.");
                     saveData();
                 } else {
-                    player.sendMessage(ChatColor.RED + targetName + " non era in lista.");
+                    player.sendMessage(ChatColor.RED + targetName + " was not in your list.");
                 }
             }
             return true;
         }
+        
+        if (mainArg.equals("count") || mainArg.equals("stats")) {
+            int dogs = 0; int cats = 0;
+            for (World world : Bukkit.getWorlds()) {
+                for (Entity entity : world.getEntities()) {
+                    if (entity instanceof Tameable) {
+                        Tameable pet = (Tameable) entity;
+                        if (pet.isTamed() && pet.getOwner() != null && pet.getOwner().equals(player)) {
+                            if (entity instanceof Wolf) dogs++;
+                            else if (entity instanceof Cat) cats++;
+                        }
+                    }
+                }
+            }
+            player.sendMessage(ChatColor.GOLD + "--- Pet Census (Loaded) ---");
+            player.sendMessage(ChatColor.GRAY + "Dogs: " + ChatColor.GREEN + dogs);
+            player.sendMessage(ChatColor.GRAY + "Cats: " + ChatColor.GREEN + cats);
+            player.sendMessage(ChatColor.YELLOW + "Total: " + ChatColor.WHITE + (dogs + cats));
+            return true;
+        }
 
-        // 4. MOVIMENTO (Call, Gohome, Sit, Stand)
+        // 6. MOVEMENT (CLEANED LOGIC)
         if (mainArg.equals("call") || mainArg.equals("gohome") || mainArg.equals("sit") || mainArg.equals("stand")) {
-            String type = "all";
-            if (args.length > 1) {
-                if (args[1].equalsIgnoreCase("dogs")) type = "dogs";
-                else if (args[1].equalsIgnoreCase("cats")) type = "cats";
+            
+            String type = "all";       // Default: Tutti i tipi
+            String age = "all";        // Default generico: Tutti le età
+            
+            // MA: Per i comandi di SPOSTAMENTO, default a ADULTI per sicurezza
+            if (mainArg.equals("call") || mainArg.equals("gohome")) {
+                age = "adults";
+            }
+
+            // Keyword Parsing Semplificato
+            for (int i = 1; i < args.length; i++) {
+                String arg = args[i].toLowerCase();
+                
+                if (arg.equals("dogs") || arg.equals("cats")) {
+                    type = arg;
+                } else if (arg.equals("babies") || arg.equals("adults")) {
+                    age = arg;
+                } else if (arg.equals("all")) {
+                    // "all" funge da jolly per l'età, sovrascrivendo "adults"
+                    // Non serve toccare il tipo, che è già "all" di default.
+                    age = "all"; 
+                }
             }
             
-            Location dest = player.getLocation(); // Default
+            Location dest = player.getLocation();
             if (mainArg.equals("gohome")) {
-                if (!homeLocations.containsKey(ownerId)) {
-                    player.sendMessage(ChatColor.RED + "Nessuna cuccia impostata! Usa prima /pets sethome");
-                    return true;
+                if (!homeLocations.containsKey(ownerId)) { 
+                    player.sendMessage(ChatColor.RED + "No home set! Please use /pets sethome first."); 
+                    return true; 
                 }
                 dest = homeLocations.get(ownerId);
             }
             
-            managePets(player, dest, mainArg, type);
+            managePets(player, dest, mainArg, type, age);
             return true;
         }
 
@@ -351,13 +519,12 @@ public class CommandPets extends JavaPlugin implements CommandExecutor, TabCompl
 
     private void sendHelp(Player p) {
         p.sendMessage(ChatColor.GOLD + "--- CommandPets Help ---");
-        p.sendMessage(ChatColor.YELLOW + "/pets call [dogs|cats]" + ChatColor.WHITE + " - Chiama a raccolta.");
-        p.sendMessage(ChatColor.YELLOW + "/pets gohome [dogs|cats]" + ChatColor.WHITE + " - Spedisce alla cuccia.");
-        p.sendMessage(ChatColor.YELLOW + "/pets sit [dogs|cats]" + ChatColor.WHITE + " - Fa sedere gli animali vicini.");
-        p.sendMessage(ChatColor.YELLOW + "/pets stand [dogs|cats]" + ChatColor.WHITE + " - Fa alzare gli animali vicini.");
-        p.sendMessage(ChatColor.YELLOW + "/pets attack <on|off>" + ChatColor.WHITE + " - I cani attaccano chi ha armi?");
-        p.sendMessage(ChatColor.YELLOW + "/pets sethome" + ChatColor.WHITE + " - Imposta qui la cuccia.");
-        p.sendMessage(ChatColor.YELLOW + "/pets friends <add|remove|list>" + ChatColor.WHITE + " - Gestisci amici.");
+        p.sendMessage(ChatColor.YELLOW + "/pets < call | sit | stand | gohome > [ dogs | cats ] [ adults | babies | all ]");
+        p.sendMessage(ChatColor.YELLOW + "/pets count" + ChatColor.WHITE + " - Show pet statistics.");
+        p.sendMessage(ChatColor.YELLOW + "/pets attack [ on | off ]");
+        p.sendMessage(ChatColor.YELLOW + "/pets silence [ on | off ]");
+        p.sendMessage(ChatColor.YELLOW + "/pets friends < add | remove | list >");
+        p.sendMessage(ChatColor.YELLOW + "/pets sethome");
     }
 
     @Override
@@ -366,32 +533,19 @@ public class CommandPets extends JavaPlugin implements CommandExecutor, TabCompl
         List<String> result = new ArrayList<>();
         
         if (args.length == 1) {
-            List<String> cmds = Arrays.asList("call", "gohome", "sit", "stand", "friends", "attack", "sethome", "help");
+            List<String> cmds = Arrays.asList("call", "gohome", "sit", "stand", "friends", "attack", "silence", "count", "sethome", "help");
             for (String s : cmds) if (s.startsWith(args[0].toLowerCase())) result.add(s);
-        } else if (args.length == 2) {
+        } else if (args.length >= 2) {
             String prev = args[0].toLowerCase();
             if (prev.equals("call") || prev.equals("gohome") || prev.equals("sit") || prev.equals("stand")) {
-                List<String> types = Arrays.asList("dogs", "cats", "all");
-                for (String s : types) if (s.startsWith(args[1].toLowerCase())) result.add(s);
-            } else if (prev.equals("friends")) {
+                List<String> suggestions = Arrays.asList("dogs", "cats", "all", "babies", "adults");
+                for (String s : suggestions) if (s.startsWith(args[args.length-1].toLowerCase())) result.add(s);
+            } else if (prev.equals("friends") && args.length == 2) {
                 List<String> sub = Arrays.asList("add", "remove", "list");
                 for (String s : sub) if (s.startsWith(args[1].toLowerCase())) result.add(s);
-            } else if (prev.equals("attack")) {
+            } else if (prev.equals("attack") || prev.equals("silence")) {
                 List<String> sub = Arrays.asList("on", "off");
                 for (String s : sub) if (s.startsWith(args[1].toLowerCase())) result.add(s);
-            }
-        } else if (args.length == 3 && args[0].equalsIgnoreCase("friends")) {
-            String sub = args[1].toLowerCase();
-            if (sub.equals("add")) {
-                for (Player p : Bukkit.getOnlinePlayers()) result.add(p.getName());
-            } else if (sub.equals("remove")) {
-                UUID oid = ((Player)sender).getUniqueId();
-                if (friendList.containsKey(oid)) {
-                    for(UUID uid : friendList.get(oid)) {
-                        String n = Bukkit.getOfflinePlayer(uid).getName();
-                        if (n!=null) result.add(n);
-                    }
-                }
             }
         }
         return result;
